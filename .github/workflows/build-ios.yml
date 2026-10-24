@@ -41,48 +41,62 @@ jobs:
           sudo rm -rf ~/Library/Developer/Xcode/DerivedData || true
           df -h /
 
-      - name: Install 7-Zip
+      # The payload was packed with 7-Zip 25.01 which enables the ARM64 BCJ
+      # filter. Homebrew's "sevenzip" is 17.05 and rejects that filter with
+      # "Unsupported Method". Fetch the official 24.x universal 7zz instead.
+      - name: Install modern 7-Zip
         run: |
           exec > >(tee -a "$LOG") 2>&1
           set -x
-          if command -v 7zz >/dev/null 2>&1; then echo "7zz present"; exit 0; fi
-          if command -v 7z  >/dev/null 2>&1; then echo "7z present";  exit 0; fi
-          brew install sevenzip
-          command -v 7zz || true
+          mkdir -p "$RUNNER_TEMP/7z"
+          cd "$RUNNER_TEMP/7z"
+          ok=0
+          for u in \
+            "https://github.com/ip7z/7zip/releases/download/25.01/7z2501-mac.tar.xz" \
+            "https://github.com/ip7z/7zip/releases/download/26.05/7z2605-mac.tar.xz" \
+            "https://www.7-zip.org/a/7z2301-mac.tar.xz" ; do
+            echo "try $u"
+            if curl -fL --retry 3 --retry-delay 2 -o 7z.tar.xz "$u"; then ok=1; break; fi
+          done
+          test "$ok" = "1"
+          ls -lh 7z.tar.xz
+          tar -xf 7z.tar.xz
+          ls -la
+          chmod +x ./7zz || true
+          echo "$RUNNER_TEMP/7z" >> "$GITHUB_PATH"
+          ./7zz | head -5
 
       - name: Probe payload volumes
         run: |
           exec > >(tee -a "$LOG") 2>&1
           set -x
+          SEVENZ=$(command -v 7zz)
+          echo "SEVENZ=$SEVENZ"
+          "$SEVENZ" | head -5
           ls -la payload
           du -sh payload
-          SEVENZ=$(command -v 7zz || command -v 7z)
-          echo "SEVENZ=$SEVENZ"
-          "$SEVENZ" i || true
-          # concatenate volumes into one contiguous archive, then test it
           cat payload/ios-build.7z.0* > /tmp/ios-build.7z
           ls -lh /tmp/ios-build.7z
-          shasum -a 256 /tmp/ios-build.7z || true
-          "$SEVENZ" l /tmp/ios-build.7z | head -40 || true
+          shasum -a 256 /tmp/ios-build.7z
+          "$SEVENZ" l /tmp/ios-build.7z | head -30
 
       - name: Extract Xcode project
         run: |
           exec > >(tee -a "$LOG") 2>&1
           set -x
-          SEVENZ=$(command -v 7zz || command -v 7z)
+          SEVENZ=$(command -v 7zz)
           mkdir -p work/iOS
           df -h /
           set +e
-          "$SEVENZ" x -y -bsp1 -owork/iOS /tmp/ios-build.7z
+          "$SEVENZ" x -y -bso0 -bsp0 -owork/iOS /tmp/ios-build.7z
           RC=$?
           set -e
           echo "extract rc=$RC"
-          ls -la work/iOS || true
           du -sh work/iOS || true
+          find work/iOS -type f | wc -l
           df -h /
           if [ "$RC" != "0" ]; then
             echo "EXTRACT FAILED rc=$RC"
-            tail -100 "$LOG" || true
             exit "$RC"
           fi
           test -f work/iOS/Unity-iPhone.xcodeproj/project.pbxproj
@@ -227,7 +241,7 @@ jobs:
             echo "sha=${GITHUB_SHA}"
             echo "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > ci-status/state.txt
-          if [ -f "$LOG" ]; then cp "$LOG" ci-status/step.txt; else echo "no step.log" > ci-status/step.txt; fi
+          if [ -f "$LOG" ]; then tail -c 400000 "$LOG" > ci-status/step.txt; else echo "no step.log" > ci-status/step.txt; fi
           ls -lh ci-status || true
           git checkout -B ci-status
           git add -Af ci-status
