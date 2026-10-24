@@ -4,6 +4,12 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths-ignore:
+      - 'ci-status/**'
+      - 'payload/**'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -12,6 +18,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Mark build started
+        run: |
+          mkdir -p ci-status
+          {
+            echo "status=running"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "sha=${GITHUB_SHA}"
+            echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > ci-status/state.txt
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git add ci-status/state.txt
+          git commit -q -m "ci: build ${GITHUB_RUN_ID} started" || true
+          git pull --rebase --autostash || true
+          git push || true
 
       - name: Free disk space
         run: |
@@ -180,3 +202,37 @@ jobs:
           echo "===== last 250 lines ====="
           tail -250 archive.log 2>/dev/null || true
           df -h / || true
+
+      - name: Publish ipa via release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          IPA="$GITHUB_WORKSPACE/work/iOS/RimWorld-unsigned.ipa"
+          ls -lh "$IPA"
+          TAG="ipa-${GITHUB_RUN_NUMBER}"
+          # gh CLI is preinstalled on GitHub-hosted macOS runners.
+          gh release create "$TAG" "$IPA" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RimWorld iOS unsigned ipa (build ${GITHUB_RUN_NUMBER})" \
+            --notes "Unsigned ipa built from commit ${GITHUB_SHA}. Sideload with your own signing (Sideloadly / AltStore / Xcode)."
+          echo "released $TAG"
+
+      - name: Mark build result
+        if: always()
+        run: |
+          mkdir -p ci-status
+          {
+            echo "status=${{ job.status }}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "sha=${GITHUB_SHA}"
+            echo "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "tag=ipa-${GITHUB_RUN_NUMBER}"
+          } > ci-status/state.txt
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git add ci-status/state.txt
+          git commit -q -m "ci: build ${GITHUB_RUN_ID} ${{ job.status }}" || true
+          git pull --rebase --autostash || true
+          git push || true
