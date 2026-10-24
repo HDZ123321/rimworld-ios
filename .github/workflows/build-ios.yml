@@ -5,13 +5,38 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - 'ci-status/**'
       - 'payload/**'
 
 permissions:
   contents: write
 
 jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Publish probe status
+        run: |
+          set -e
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          mkdir -p ci-status
+          {
+            echo "probe=ok"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_number=${GITHUB_RUN_NUMBER}"
+            echo "sha=${GITHUB_SHA}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > ci-status/probe.txt
+          git checkout -B ci-status
+          git add -A ci-status
+          git commit -q -m "ci: probe ${GITHUB_RUN_ID}" || true
+          git push -f origin HEAD:refs/heads/ci-status
+          echo "probe pushed"
+
   build:
     runs-on: macos-14
     timeout-minutes: 350
@@ -21,6 +46,8 @@ jobs:
 
       - name: Mark build started
         run: |
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
           mkdir -p ci-status
           {
             echo "status=running"
@@ -28,18 +55,15 @@ jobs:
             echo "sha=${GITHUB_SHA}"
             echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > ci-status/state.txt
-          git config user.name  "ci-bot"
-          git config user.email "ci-bot@users.noreply.github.com"
-          git add ci-status/state.txt
+          git checkout -B ci-status
+          git add -A ci-status
           git commit -q -m "ci: build ${GITHUB_RUN_ID} started" || true
-          git pull --rebase --autostash || true
-          git push || true
+          git push -f origin HEAD:refs/heads/ci-status || true
 
       - name: Free disk space
         run: |
           set -x
           df -h /
-          # Keep exactly one Xcode (the newest 15.x); each extra Xcode is ~10 GB.
           KEEP=""
           for v in /Applications/Xcode_15.4.app /Applications/Xcode_15.3.app \
                    /Applications/Xcode_15.2.app /Applications/Xcode_15.1.app \
@@ -74,7 +98,7 @@ jobs:
           du -sh work/iOS
           ls work/iOS
 
-      - name: Free disk (drop payload + intel il2cpp + dSYM inputs)
+      - name: Free disk (drop payload + intel il2cpp)
         run: |
           rm -rf payload
           rm -rf work/iOS/Il2CppOutputProject/IL2CPP/build/deploy_x86_64
@@ -102,14 +126,10 @@ jobs:
           cd work/iOS
           IL2CPP_DIR=Il2CppOutputProject/IL2CPP/build/deploy_arm64
           ls -la "$IL2CPP_DIR" | head -20
-          # 7z extraction drops the exec bit; restore it for the two binaries
-          # the GameAssembly run-script phase invokes.
           chmod +x "$IL2CPP_DIR/il2cpp"
           chmod +x "$IL2CPP_DIR/bee_backend/mac-arm64/bee_backend"
           file "$IL2CPP_DIR/il2cpp"
           file "$IL2CPP_DIR/bee_backend/mac-arm64/bee_backend"
-          # Unity ships these signed; strip the signature so macOS does not
-          # refuse to exec a binary whose signature no longer matches on disk.
           codesign --remove-signature "$IL2CPP_DIR/il2cpp" 2>/dev/null || true
           codesign --remove-signature "$IL2CPP_DIR/bee_backend/mac-arm64/bee_backend" 2>/dev/null || true
           "$IL2CPP_DIR/il2cpp" --version || echo "il2cpp --version returned $?"
@@ -135,8 +155,6 @@ jobs:
             DEBUG_INFORMATION_FORMAT=dwarf \
             VALIDATE_PRODUCT=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
-            GCC_OPTIMIZATION_LEVEL=s \
-            SWIFT_OPTIMIZATION_LEVEL=-O \
             2>&1 | tee "$GITHUB_WORKSPACE/archive.log"
 
       - name: Package unsigned ipa
@@ -168,15 +186,12 @@ jobs:
           zip -qry ../RimWorld-unsigned.ipa Payload
           cd ..
           ls -lh RimWorld-unsigned.ipa
-          echo "--- bundle sanity ---"
           APPB=$(basename "$APP")
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "Payload/$APPB/Info.plist" || true
           /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "Payload/$APPB/Info.plist" || true
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "Payload/$APPB/Info.plist" || true
           ls -la "Payload/$APPB" | head -25
-          echo "--- size of Data/Raw (StreamingAssets) ---"
           du -sh "Payload/$APPB/Data/Raw" || true
-          echo "--- Mach-O arch of main binary ---"
           lipo -info "Payload/$APPB/$APPB" || true
           df -h /
 
@@ -212,16 +227,17 @@ jobs:
           IPA="$GITHUB_WORKSPACE/work/iOS/RimWorld-unsigned.ipa"
           ls -lh "$IPA"
           TAG="ipa-${GITHUB_RUN_NUMBER}"
-          # gh CLI is preinstalled on GitHub-hosted macOS runners.
           gh release create "$TAG" "$IPA" \
             --repo "$GITHUB_REPOSITORY" \
             --title "RimWorld iOS unsigned ipa (build ${GITHUB_RUN_NUMBER})" \
-            --notes "Unsigned ipa built from commit ${GITHUB_SHA}. Sideload with your own signing (Sideloadly / AltStore / Xcode)."
+            --notes "Unsigned ipa built from commit ${GITHUB_SHA}. Sideload with your own signing."
           echo "released $TAG"
 
       - name: Mark build result
         if: always()
         run: |
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
           mkdir -p ci-status
           {
             echo "status=${{ job.status }}"
@@ -230,9 +246,7 @@ jobs:
             echo "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "tag=ipa-${GITHUB_RUN_NUMBER}"
           } > ci-status/state.txt
-          git config user.name  "ci-bot"
-          git config user.email "ci-bot@users.noreply.github.com"
-          git add ci-status/state.txt
+          git checkout -B ci-status
+          git add -A ci-status
           git commit -q -m "ci: build ${GITHUB_RUN_ID} ${{ job.status }}" || true
-          git pull --rebase --autostash || true
-          git push || true
+          git push -f origin HEAD:refs/heads/ci-status || true
