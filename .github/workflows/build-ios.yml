@@ -8,16 +8,37 @@ on:
 jobs:
   build:
     runs-on: macos-14
-    timeout-minutes: 330
+    timeout-minutes: 350
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          # Keep exactly one Xcode (the newest 15.x); each extra Xcode is ~10 GB.
+          KEEP=""
+          for v in /Applications/Xcode_15.4.app /Applications/Xcode_15.3.app \
+                   /Applications/Xcode_15.2.app /Applications/Xcode_15.1.app \
+                   /Applications/Xcode_15.0.1.app /Applications/Xcode_15.0.app \
+                   /Applications/Xcode.app; do
+            if [ -d "$v" ] && [ -z "$KEEP" ]; then KEEP="$v"; fi
+          done
+          echo "KEEP=$KEEP"
+          for v in /Applications/Xcode*.app; do
+            if [ "$v" != "$KEEP" ]; then sudo rm -rf "$v" || true; fi
+          done
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches || true
+          sudo rm -rf ~/Library/Developer/Xcode/DerivedData || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes || true
+          df -h /
+
       - name: Install 7-Zip
         run: |
           set -e
-          if command -v 7z  >/dev/null 2>&1; then echo "7z already present"; exit 0; fi
-          if command -v 7zz >/dev/null 2>&1; then echo "7zz already present"; exit 0; fi
+          if command -v 7z  >/dev/null 2>&1; then echo "7z present";  exit 0; fi
+          if command -v 7zz >/dev/null 2>&1; then echo "7zz present"; exit 0; fi
           brew install sevenzip
 
       - name: Extract Xcode project
@@ -29,21 +50,21 @@ jobs:
           "$SEVENZ" x -y -owork/iOS payload/ios-build.7z.001
           test -f work/iOS/Unity-iPhone.xcodeproj/project.pbxproj
           du -sh work/iOS
-          df -h /
+          ls work/iOS
 
-      - name: Free disk (drop payload + intel il2cpp)
+      - name: Free disk (drop payload + intel il2cpp + dSYM inputs)
         run: |
           rm -rf payload
           rm -rf work/iOS/Il2CppOutputProject/IL2CPP/build/deploy_x86_64
           df -h /
 
-      - name: Select Xcode 15
+      - name: Select Xcode
         run: |
           set -e
-          ls -d /Applications/Xcode*.app || true
           for v in /Applications/Xcode_15.4.app /Applications/Xcode_15.3.app \
                    /Applications/Xcode_15.2.app /Applications/Xcode_15.1.app \
-                   /Applications/Xcode_15.0.1.app /Applications/Xcode_15.0.app; do
+                   /Applications/Xcode_15.0.1.app /Applications/Xcode_15.0.app \
+                   /Applications/Xcode.app; do
             if [ -d "$v" ]; then
               echo "DEVELOPER_DIR=$v" >> "$GITHUB_ENV"
               echo "selected $v"
@@ -51,19 +72,25 @@ jobs:
             fi
           done
           xcodebuild -version
+          xcode-select -p
 
       - name: Sanity check IL2CPP host toolchain
         run: |
           set -e
           cd work/iOS
           IL2CPP_DIR=Il2CppOutputProject/IL2CPP/build/deploy_arm64
+          ls -la "$IL2CPP_DIR" | head -20
           # 7z extraction drops the exec bit; restore it for the two binaries
           # the GameAssembly run-script phase invokes.
           chmod +x "$IL2CPP_DIR/il2cpp"
           chmod +x "$IL2CPP_DIR/bee_backend/mac-arm64/bee_backend"
           file "$IL2CPP_DIR/il2cpp"
-          codesign -dv "$IL2CPP_DIR/il2cpp" 2>&1 | head -5 || true
-          "$IL2CPP_DIR/il2cpp" --version || true
+          file "$IL2CPP_DIR/bee_backend/mac-arm64/bee_backend"
+          # Unity ships these signed; strip the signature so macOS does not
+          # refuse to exec a binary whose signature no longer matches on disk.
+          codesign --remove-signature "$IL2CPP_DIR/il2cpp" 2>/dev/null || true
+          codesign --remove-signature "$IL2CPP_DIR/bee_backend/mac-arm64/bee_backend" 2>/dev/null || true
+          "$IL2CPP_DIR/il2cpp" --version || echo "il2cpp --version returned $?"
 
       - name: Archive (unsigned)
         run: |
@@ -75,6 +102,7 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$PWD/build/RimWorld.xcarchive" \
+            -derivedDataPath "$PWD/build/dd" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -85,13 +113,30 @@ jobs:
             DEBUG_INFORMATION_FORMAT=dwarf \
             VALIDATE_PRODUCT=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
+            GCC_OPTIMIZATION_LEVEL=s \
+            SWIFT_OPTIMIZATION_LEVEL=-O \
             2>&1 | tee "$GITHUB_WORKSPACE/archive.log"
 
       - name: Package unsigned ipa
         run: |
           set -e
           cd work/iOS
-          APP=$(find build/RimWorld.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
+          APP=$(find build/RimWorld.xcarchive/Products/Applications -maxdepth 1 -name '*.app' 2>/dev/null | head -1)
+          if [ -z "$APP" ]; then
+            echo "archive produced no .app, falling back to plain build"
+            xcodebuild build \
+              -project Unity-iPhone.xcodeproj \
+              -scheme Unity-iPhone \
+              -configuration Release \
+              -sdk iphoneos \
+              -derivedDataPath "$PWD/build/dd" \
+              CONFIGURATION_BUILD_DIR="$PWD/build/out" \
+              CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGN_ENTITLEMENTS="" ENABLE_BITCODE=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+              DEBUG_INFORMATION_FORMAT=dwarf VALIDATE_PRODUCT=NO COMPILER_INDEX_STORE_ENABLE=NO \
+              2>&1 | tee "$GITHUB_WORKSPACE/archive.log"
+            APP=$(find build/out -maxdepth 1 -name '*.app' | head -1)
+          fi
           echo "APP=$APP"
           test -n "$APP"
           rm -rf ipa
@@ -101,13 +146,17 @@ jobs:
           zip -qry ../RimWorld-unsigned.ipa Payload
           cd ..
           ls -lh RimWorld-unsigned.ipa
-          unzip -l RimWorld-unsigned.ipa | head -25
           echo "--- bundle sanity ---"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "Payload/$(basename "$APP")/Info.plist" || true
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "Payload/$(basename "$APP")/Info.plist" || true
-          ls -la "Payload/$(basename "$APP")" | head -20
+          APPB=$(basename "$APP")
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "Payload/$APPB/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "Payload/$APPB/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "Payload/$APPB/Info.plist" || true
+          ls -la "Payload/$APPB" | head -25
           echo "--- size of Data/Raw (StreamingAssets) ---"
-          du -sh "Payload/$(basename "$APP")/Data/Raw" || true
+          du -sh "Payload/$APPB/Data/Raw" || true
+          echo "--- Mach-O arch of main binary ---"
+          lipo -info "Payload/$APPB/$APPB" || true
+          df -h /
 
       - name: Upload ipa
         uses: actions/upload-artifact@v4
@@ -128,6 +177,6 @@ jobs:
       - name: Show failure tail
         if: failure()
         run: |
-          echo "===== last 200 lines ====="
-          tail -200 archive.log 2>/dev/null || true
+          echo "===== last 250 lines ====="
+          tail -250 archive.log 2>/dev/null || true
           df -h / || true
