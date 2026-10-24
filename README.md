@@ -102,3 +102,12 @@ zip -qry RimWorld-signed.ipa Payload
 - 首次启动要扫 491 MB StreamingAssets 建 Def 数据库，A 系列芯片约 20–40 秒
 - iOS 无滚轮，滚动靠 PortInput 注入 `GUI.BeginScrollView` 的位移
 - 平板横屏体验最好；竖屏可用但 UI 密度按短边算会偏小
+
+## 更新记录
+
+### build 2 — 中文字体 + 仅 Core
+
+- **字体修复**：原来 `Assets/Resources/fonts/Arial_small.asset` / `Arial_medium.asset` 是 Unity 动态系统字体（`m_FontData` 为空、只靠 `m_FontNames: [Arial]` 向 OS 要字形）。Windows 上 GDI 字体链接会把 Arial 回退到中文字体，所以编辑器里中文正常；iOS 的 CoreText 没有这条回退链，Arial 本身也没有 CJK 字形，于是每个汉字都渲染成 .notdef 方框。
+  现已替换为 **Noto Sans SC Regular**（fontTools 从可变字体实例化 wght=400 的静态 TTF，10,595,876 字节），三档字号各一份、度量统一（ascent 905 / descent -212 / lineGap 33），并**复用原 .meta 的 GUID**（`6f0af78a…` / `ab8c9da3…` / `d8bc6d18…`），`Text.cs` 里的三处 `Resources.Load("Fonts/...")` 一行未改。
+- **移除全部 DLC**：`Assets/StreamingAssets/Data/` 只保留 `Core`，Royalty / Ideology / Biotech / Anomaly / Odyssey 五个目录连同 `.meta` 全部删除。Core 的 `About.xml` 里 `forceLoadBefore` 指向这些包，但 `ModsConfig` 四处使用点都先判空再跳过，无需改 XML。
+- 体积：构建产物 2562 MB → **2222 MB**，`Data/Raw` 490 MB → **118 MB**，`resources.assets` 6.7 MB → **37.9 MB**（三个字体嵌入所致）。
