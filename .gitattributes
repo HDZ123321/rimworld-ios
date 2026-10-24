@@ -1,0 +1,4 @@
+* -text
+*.7z.* binary
+*.yml text eol=lf
+*.md text eol=lf

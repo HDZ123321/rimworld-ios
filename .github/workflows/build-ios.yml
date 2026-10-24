@@ -1,0 +1,133 @@
+name: build-ios-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install 7-Zip
+        run: |
+          set -e
+          if command -v 7z  >/dev/null 2>&1; then echo "7z already present"; exit 0; fi
+          if command -v 7zz >/dev/null 2>&1; then echo "7zz already present"; exit 0; fi
+          brew install sevenzip
+
+      - name: Extract Xcode project
+        run: |
+          set -e
+          SEVENZ=$(command -v 7z || command -v 7zz || command -v 7za)
+          echo "using $SEVENZ"
+          mkdir -p work/iOS
+          "$SEVENZ" x -y -owork/iOS payload/ios-build.7z.001
+          test -f work/iOS/Unity-iPhone.xcodeproj/project.pbxproj
+          du -sh work/iOS
+          df -h /
+
+      - name: Free disk (drop payload + intel il2cpp)
+        run: |
+          rm -rf payload
+          rm -rf work/iOS/Il2CppOutputProject/IL2CPP/build/deploy_x86_64
+          df -h /
+
+      - name: Select Xcode 15
+        run: |
+          set -e
+          ls -d /Applications/Xcode*.app || true
+          for v in /Applications/Xcode_15.4.app /Applications/Xcode_15.3.app \
+                   /Applications/Xcode_15.2.app /Applications/Xcode_15.1.app \
+                   /Applications/Xcode_15.0.1.app /Applications/Xcode_15.0.app; do
+            if [ -d "$v" ]; then
+              echo "DEVELOPER_DIR=$v" >> "$GITHUB_ENV"
+              echo "selected $v"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      - name: Sanity check IL2CPP host toolchain
+        run: |
+          set -e
+          cd work/iOS
+          IL2CPP_DIR=Il2CppOutputProject/IL2CPP/build/deploy_arm64
+          # 7z extraction drops the exec bit; restore it for the two binaries
+          # the GameAssembly run-script phase invokes.
+          chmod +x "$IL2CPP_DIR/il2cpp"
+          chmod +x "$IL2CPP_DIR/bee_backend/mac-arm64/bee_backend"
+          file "$IL2CPP_DIR/il2cpp"
+          codesign -dv "$IL2CPP_DIR/il2cpp" 2>&1 | head -5 || true
+          "$IL2CPP_DIR/il2cpp" --version || true
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          cd work/iOS
+          xcodebuild archive \
+            -project Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/RimWorld.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            ENABLE_BITCODE=NO \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            VALIDATE_PRODUCT=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee "$GITHUB_WORKSPACE/archive.log"
+
+      - name: Package unsigned ipa
+        run: |
+          set -e
+          cd work/iOS
+          APP=$(find build/RimWorld.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
+          echo "APP=$APP"
+          test -n "$APP"
+          rm -rf ipa
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          cd ipa
+          zip -qry ../RimWorld-unsigned.ipa Payload
+          cd ..
+          ls -lh RimWorld-unsigned.ipa
+          unzip -l RimWorld-unsigned.ipa | head -25
+          echo "--- bundle sanity ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "Payload/$(basename "$APP")/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "Payload/$(basename "$APP")/Info.plist" || true
+          ls -la "Payload/$(basename "$APP")" | head -20
+          echo "--- size of Data/Raw (StreamingAssets) ---"
+          du -sh "Payload/$(basename "$APP")/Data/Raw" || true
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: RimWorld-unsigned-ipa
+          path: work/iOS/RimWorld-unsigned.ipa
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload archive log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: archive.log
+          if-no-files-found: warn
+
+      - name: Show failure tail
+        if: failure()
+        run: |
+          echo "===== last 200 lines ====="
+          tail -200 archive.log 2>/dev/null || true
+          df -h / || true
