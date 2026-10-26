@@ -1,4 +1,4 @@
-﻿name: build-ios-ipa
+name: build-ios-ipa
 
 on:
   workflow_dispatch:
@@ -16,12 +16,13 @@ env:
   # 但 sccache 还要存源码哈希索引与压缩副本；给到 8G 留 2G 给 artifact/cache 别的用途。
   # 不设上限的话 sccache 默认 10G，会把整个 cache 配额吃满，导致别的 run 全部 miss。
   SCCACHE_CACHE_SIZE: 8G
-  # 这两项必须在 workflow 级就设上：sccache 是常驻 daemon，由「第一个调用它的 step」
-  # 拉起，之后整个 job 共用这一个进程，它只认自己启动时的环境变量。原来只写在 Archive
-  # 一步的 env 里，而 Wrap-clang 那步先跑了 sccache --show-stats 把 daemon 拉起来 ——
-  # 后端于是永远是本地磁盘，Actions cache 一次都没写过，每次 run 都是冷编译。
-  SCCACHE_GHA_ENABLED: "true"
-  SCCACHE_GHA_VERSION: "1"
+  # 缓存后端用本地磁盘 + actions/cache 整目录搬运，明确不用 ghac。
+  # run #23 的实测：ghac 后端在 daemon 启动自检时碰到一次
+  #   artifactcache.actions.githubusercontent.com -> "Our services aren't available right now"
+  # server 直接起不来，垫片自检失败并退回系统 clang，全程 Compile requests = 0，
+  # 缓存一行没写（那次 35.3 min 和冷编基线 39.8 min 的差是机器波动，不是缓存收益）。
+  # 本地磁盘后端没有网络自检，daemon 必定能起；跨 run 复用交给 actions/cache 的 key 滚动。
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
 
 jobs:
   build:
@@ -143,14 +144,28 @@ jobs:
 
       # Archive 一步要冷编译 721 个 IL2CPP 生成的 .cpp（合计 1.09 GB），
       # 每个 run 都是全新 runner + 空 derivedDataPath，等于每次都从零编一遍。
-      # sccache 把编译产物按内容哈希存进 Actions cache（10 GB 额度），
-      # 第二次起只有真正改动过的翻译单元会重编。
+      # 只缓存 sccache 的 .o：它按源码内容哈希命中，不受文件 mtime 影响。
+      # derivedDataPath 不做缓存 —— checkout 出来的源文件 mtime 永远比缓存里的新，
+      # Xcode 增量判定必然全量重编，搬过去只是白白占 cache 额度。
+      - name: Restore sccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .sccache
+          key: sccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            sccache-${{ runner.os }}-
+            sccache-${{ runner.os }}
+
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.6
 
       # xcodebuild 不认 CC="sccache clang" 这种带空格的写法，
       # 标准做法是放一层 clang 垫片在 PATH 最前面，让 xcrun 解析到的 clang 被截走。
       - name: Wrap clang with sccache
+        # sccache-action 会往 GITHUB_ENV 里塞 SCCACHE_GHA_ENABLED=true。step 级 env
+        # 优先级高于 GITHUB_ENV，这里压成 false，确保 daemon 一定用本地磁盘后端启动。
+        env:
+          SCCACHE_GHA_ENABLED: "false"
         run: |
           exec > >(tee -a "$LOG") 2>&1
           set -e
@@ -158,17 +173,20 @@ jobs:
           CXX_BIN=$(xcrun -f clang++)
           echo "clang=$CC_BIN"
           echo "clangxx=$CXX_BIN"
-          mkdir -p "$RUNNER_TEMP/ccwrap"
-          printf '#!/bin/bash\nexec sccache "%s" "$@"\n' "$CC_BIN"  > "$RUNNER_TEMP/ccwrap/clang"
-          printf '#!/bin/bash\nexec sccache "%s" "$@"\n' "$CXX_BIN" > "$RUNNER_TEMP/ccwrap/clang++"
-          chmod +x "$RUNNER_TEMP/ccwrap/clang" "$RUNNER_TEMP/ccwrap/clang++"
+          SHIM="$RUNNER_TEMP/ccwrap"
+          mkdir -p "$SHIM"
+          printf '#!/bin/bash\nexec sccache "%s" "$@"\n' "$CC_BIN"  > "$SHIM/clang"
+          printf '#!/bin/bash\nexec sccache "%s" "$@"\n' "$CXX_BIN" > "$SHIM/clang++"
+          chmod +x "$SHIM/clang" "$SHIM/clang++"
           sccache --version || true
-          # 冒烟：只在确认垫片能把 --version 透传过去之后才写进 GITHUB_PATH。
-          # 垫片一旦坏了会截走整个 job 的 clang，archive 直接全红，代价是一次 45 分钟的 run；
-          # 这里先在本 step 内验证一遍，坏了就退回系统 clang（不缓存也能编）。
-          export PATH="$RUNNER_TEMP/ccwrap:$PATH"
+          # 冒烟：垫片必须能把 --version 透传过去，否则一律退回系统 clang。
+          # 垫片一旦坏了会截走整个 job 的 clang，archive 全红，代价是一次 50 分钟的 run。
+          export PATH="$SHIM:$PATH"
           if clang --version && clang++ --version; then
-            echo "$RUNNER_TEMP/ccwrap" >> "$GITHUB_PATH"
+            echo "$SHIM" >> "$GITHUB_PATH"
+            # 给 Archive 用：xcodebuild 只认命令行 build setting，不认 CC 环境变量
+            echo "SCCACHE_CC=$SHIM/clang"   >> "$GITHUB_ENV"
+            echo "SCCACHE_CXX=$SHIM/clang++" >> "$GITHUB_ENV"
             echo "sccache shim active"
           else
             echo "::warning::sccache clang shim is broken; running archive with the system clang (no compiler cache)"
@@ -199,6 +217,23 @@ jobs:
           set -x
           sccache --show-stats || true
           cd work/iOS
+          # xcodebuild 不认 CC/CXX 环境变量（那是 make 的约定），编译器路径只能当
+          # build setting 从命令行传。先探针确认覆盖被接受：接受才用垫片，不接受就
+          # 老老实实冷编，绝不因为探针失败把 50 分钟的 archive 弄红。
+          CC_ARGS=()
+          if [ -n "${SCCACHE_CC:-}" ]; then
+            PROBE=$(xcodebuild -project Unity-iPhone.xcodeproj -scheme Unity-iPhone \
+                      -configuration Release -sdk iphoneos -showBuildSettings \
+                      CC="$SCCACHE_CC" CXX="$SCCACHE_CXX" 2>/dev/null \
+                      | awk -F' = ' '/^ *CC = /{print $2; exit}')
+            echo "probe: CC=$PROBE"
+            if [ "$PROBE" = "$SCCACHE_CC" ]; then
+              CC_ARGS=("CC=$SCCACHE_CC" "CXX=$SCCACHE_CXX")
+              echo "::notice::xcodebuild accepts the sccache clang shim"
+            else
+              echo "::warning::xcodebuild ignored the CC override; archive runs uncached"
+            fi
+          fi
           xcodebuild archive \
             -project Unity-iPhone.xcodeproj \
             -scheme Unity-iPhone \
@@ -215,10 +250,12 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             DEBUG_INFORMATION_FORMAT=dwarf \
             VALIDATE_PRODUCT=NO \
-            COMPILER_INDEX_STORE_ENABLE=NO
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            "${CC_ARGS[@]}"
           rc=$?
           echo "=== sccache stats after archive (rc=$rc) ==="
           sccache --show-stats || true
+          du -sh "${SCCACHE_DIR:-$HOME/.cache/sccache}" 2>/dev/null || true
           exit $rc
       - name: Package unsigned ipa
         run: |
@@ -301,3 +338,12 @@ jobs:
           git add -Af ci-status
           git commit -q -m "ci: build ${GITHUB_RUN_ID} ${{ job.status }}" || true
           git push -f origin HEAD:refs/heads/ci-status || true
+
+      # 尾部显式落盘：restore 用的是 actions/cache/restore，配套的 save 要自己调，
+      # key 必须与 restore 逐字一致，否则每次都写新条目、永远读不到刚存的那份。
+      - name: Save sccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .sccache
+          key: sccache-${{ runner.os }}-${{ github.sha }}
