@@ -1,4 +1,4 @@
-name: build-ios-ipa
+﻿name: build-ios-ipa
 
 on:
   workflow_dispatch:
@@ -12,11 +12,25 @@ permissions:
 
 env:
   LOG: ${{ github.workspace }}/step.log
+  # Actions cache 总共 10 GB。721 个 IL2CPP 翻译单元的 .o 加起来约 3 GB，
+  # 但 sccache 还要存源码哈希索引与压缩副本；给到 8G 留 2G 给 artifact/cache 别的用途。
+  # 不设上限的话 sccache 默认 10G，会把整个 cache 配额吃满，导致别的 run 全部 miss。
+  SCCACHE_CACHE_SIZE: 8G
+  # 这两项必须在 workflow 级就设上：sccache 是常驻 daemon，由「第一个调用它的 step」
+  # 拉起，之后整个 job 共用这一个进程，它只认自己启动时的环境变量。原来只写在 Archive
+  # 一步的 env 里，而 Wrap-clang 那步先跑了 sccache --show-stats 把 daemon 拉起来 ——
+  # 后端于是永远是本地磁盘，Actions cache 一次都没写过，每次 run 都是冷编译。
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_VERSION: "1"
 
 jobs:
   build:
     runs-on: macos-14
     timeout-minutes: 350
+    # 注意别在这层给 SCCACHE_DIR 写 runner.temp：job 级 env 求值时也没有
+    # runner 上下文，GitHub 直接判 workflow 非法（"Unrecognized named-value: 'runner'",
+    # run 建出来 0 个 job 立刻 failure）。sccache 在本机默认落 ~/.cache/sccache，
+    # 位置无所谓，真正决定能不能复用的是 SCCACHE_GHA_ENABLED 那两项。
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -127,6 +141,42 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
+      # Archive 一步要冷编译 721 个 IL2CPP 生成的 .cpp（合计 1.09 GB），
+      # 每个 run 都是全新 runner + 空 derivedDataPath，等于每次都从零编一遍。
+      # sccache 把编译产物按内容哈希存进 Actions cache（10 GB 额度），
+      # 第二次起只有真正改动过的翻译单元会重编。
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      # xcodebuild 不认 CC="sccache clang" 这种带空格的写法，
+      # 标准做法是放一层 clang 垫片在 PATH 最前面，让 xcrun 解析到的 clang 被截走。
+      - name: Wrap clang with sccache
+        run: |
+          exec > >(tee -a "$LOG") 2>&1
+          set -e
+          CC_BIN=$(xcrun -f clang)
+          CXX_BIN=$(xcrun -f clang++)
+          echo "clang=$CC_BIN"
+          echo "clangxx=$CXX_BIN"
+          mkdir -p "$RUNNER_TEMP/ccwrap"
+          printf '#!/bin/bash\nexec sccache "%s" "$@"\n' "$CC_BIN"  > "$RUNNER_TEMP/ccwrap/clang"
+          printf '#!/bin/bash\nexec sccache "%s" "$@"\n' "$CXX_BIN" > "$RUNNER_TEMP/ccwrap/clang++"
+          chmod +x "$RUNNER_TEMP/ccwrap/clang" "$RUNNER_TEMP/ccwrap/clang++"
+          sccache --version || true
+          # 冒烟：只在确认垫片能把 --version 透传过去之后才写进 GITHUB_PATH。
+          # 垫片一旦坏了会截走整个 job 的 clang，archive 直接全红，代价是一次 45 分钟的 run；
+          # 这里先在本 step 内验证一遍，坏了就退回系统 clang（不缓存也能编）。
+          export PATH="$RUNNER_TEMP/ccwrap:$PATH"
+          if clang --version && clang++ --version; then
+            echo "$RUNNER_TEMP/ccwrap" >> "$GITHUB_PATH"
+            echo "sccache shim active"
+          else
+            echo "::warning::sccache clang shim is broken; running archive with the system clang (no compiler cache)"
+          fi
+          echo "--- sccache backend ---"
+          env | grep -E '^SCCACHE_' | sort || true
+          sccache --show-stats || true
+
       - name: Sanity check IL2CPP host toolchain
         run: |
           exec > >(tee -a "$LOG") 2>&1
@@ -147,6 +197,7 @@ jobs:
           exec > >(tee -a "$LOG") 2>&1
           set -o pipefail
           set -x
+          sccache --show-stats || true
           cd work/iOS
           xcodebuild archive \
             -project Unity-iPhone.xcodeproj \
@@ -165,7 +216,10 @@ jobs:
             DEBUG_INFORMATION_FORMAT=dwarf \
             VALIDATE_PRODUCT=NO \
             COMPILER_INDEX_STORE_ENABLE=NO
-
+          rc=$?
+          echo "=== sccache stats after archive (rc=$rc) ==="
+          sccache --show-stats || true
+          exit $rc
       - name: Package unsigned ipa
         run: |
           exec > >(tee -a "$LOG") 2>&1
