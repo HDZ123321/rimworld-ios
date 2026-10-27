@@ -53,6 +53,30 @@ ExitCode: 0 Duration: 35m:46s
 
 生成代码少了三分之一，clang 的活就少了三分之一，CI 的 il2cpp 段预期同比缩短。
 
+### 2.1 CI 实测结果（run #26，`3d1b2f8`）
+
+| 项 | run #25 (build 12) | run #26 (build 13) | 变化 |
+| --- | --- | --- | --- |
+| il2cpp 段（bee_backend 自报 `Duration`） | 35m46s (2146.2 s) | **17m42s (1064.3 s)** | **-50.4%** |
+| Archive 步骤总时长 | 37.1 min (2226.9 s) | 18.5 min (1112.7 s) | **-50.0%** |
+| `builtin-copy` 拷 Data/Raw | 23.3 s | 11.1 s | -52% |
+| 最终 UnityFramework 链接 | 11.9 s | 4.1 s | -66% |
+| CI 全流程 | 43.5 min | **19.1 min** | **-24.4 min** |
+
+`bee_backend` 那两行是直接证据：
+
+```
+run #25: ExitCode: 0 Duration: 35m:46s
+run #26: ExitCode: 0 Duration: 17m:42s
+```
+
+收益超过源码量降幅（35%），因为编译单元少了 244 个，每个单元的固定开销
+（预处理、模板实例化上下文）随之消失。
+
+产物：`out/RimWorld-unsigned-b13.ipa`，655,645,690 字节（625.3 MB，比 b12 小 8.6 MB），
+sha256 `3A6F69C256E129AE2C78BB31F4B1BCCF5124F8D6DB54C552F7950E90B2FB0E6E`。
+ipa 内部：`global-metadata.dat` 23.8 → 22.7 MB，`UnityFramework` 132.1 → 84.4 MB。
+
 ## 3. 风险与回归清单
 
 `OptimizeSize` 只影响代码生成策略，不改变语义，运行时正确性风险低，代价是速度。
